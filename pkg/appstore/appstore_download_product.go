@@ -24,6 +24,17 @@ type downloadProductEndpoint struct {
 }
 
 func (t *appstore) sendDownloadProduct(acc Account, app App, guid, externalVersionID string, platform Platform) (http.Result[downloadResult], Platform, error) {
+	// An unpinned request can return the iOS build of a universal app.
+	// Select the Mac offer before accepting any download response.
+	if externalVersionID == "" && platform == PlatformMacOS {
+		var err error
+
+		externalVersionID, err = t.lookupLatestMacOSExternalVersionID(acc, app)
+		if err != nil {
+			return http.Result[downloadResult]{}, platform, fmt.Errorf("failed to resolve latest macOS version for download: %w", err)
+		}
+	}
+
 	volumeStore := t.volumeStoreEndpoint(acc)
 
 	res, err := t.downloadClient.Send(t.downloadProductRequest(volumeStore, acc, app, guid, externalVersionID))
@@ -33,24 +44,6 @@ func (t *appstore) sendDownloadProduct(acc Account, app App, guid, externalVersi
 
 	if !isEmptyDownloadProductResponse(res) && !isUnavailableDownloadProductResponse(res) {
 		return res, platform, nil
-	}
-
-	if externalVersionID == "" && platform == PlatformMacOS {
-		externalVersionID, err = t.lookupLatestMacOSExternalVersionID(acc, app)
-		if err != nil {
-			return res, platform, fmt.Errorf("failed to resolve latest macOS version for download: %w", err)
-		}
-
-		// Pin the Mac offer on volumeStore itself. The redownload endpoint
-		// can still return an empty HTTP 500 for the same pinned Mac version.
-		res, err = t.downloadClient.Send(t.downloadProductRequest(volumeStore, acc, app, guid, externalVersionID))
-		if err != nil {
-			return res, platform, fmt.Errorf("failed to send pinned macOS download request: %w", err)
-		}
-
-		if !isEmptyDownloadProductResponse(res) && !isUnavailableDownloadProductResponse(res) {
-			return res, platform, nil
-		}
 	}
 
 	// Try redownload when volumeStore returns no items, either silently or
@@ -84,7 +77,7 @@ func (t *appstore) sendDownloadProduct(acc Account, app App, guid, externalVersi
 
 	redownloadRes, err := t.downloadClient.Send(t.downloadProductRequest(redownload, acc, app, guid, externalVersionID))
 	if bag.UpdateEndpoint != "" && externalVersionID != "" &&
-		(platform == "" || platform == PlatformIPhone || platform == PlatformIPad) &&
+		(platform == "" || platform == PlatformIPhone || platform == PlatformIPad || platform == PlatformMacOS) &&
 		(isEmptyRedownloadError(err) || (err == nil && isUnavailableDownloadProductResponse(redownloadRes))) {
 		updateRes, updateErr := t.sendUpdateProduct(bag.UpdateEndpoint, acc, app, guid, externalVersionID)
 
@@ -115,7 +108,7 @@ func (t *appstore) sendUpdateProduct(endpoint string, acc Account, app App, guid
 		return http.Result[downloadResult]{}, err
 	}
 
-	// The bag's updateProduct can serve pinned iOS versions when redownload
+	// The bag's updateProduct can serve pinned iOS and macOS versions when redownload
 	// returns an empty HTTP 500 or a message-only availability error. Keep
 	// the same session and version selection.
 	res, err := t.downloadClient.Send(t.downloadProductRequest(update, acc, app, guid, externalVersionID))
