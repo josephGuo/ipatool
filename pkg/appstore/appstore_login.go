@@ -9,6 +9,7 @@ import (
 	"net"
 	gohttp "net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -21,6 +22,15 @@ import (
 var (
 	ErrAuthCodeRequired = errors.New("auth code is required")
 )
+
+type authenticationMachineActionError struct {
+	action string
+	data   string
+}
+
+func (e *authenticationMachineActionError) Error() string {
+	return "apple requested an authentication machine action: " + e.action
+}
 
 const (
 	maxAuthenticationRequestAttempts = 3
@@ -43,9 +53,23 @@ type LoginOutput struct {
 }
 
 func (t *appstore) Login(input LoginInput) (LoginOutput, error) {
+	if t.authBackend != nil {
+		return t.nativeLogin(input)
+	}
+
+	return t.legacyLogin(input)
+}
+
+func (t *appstore) legacyLogin(input LoginInput) (LoginOutput, error) {
 	authCode, err := normalizeAuthCode(input.AuthCode)
 	if err != nil {
 		return LoginOutput{}, err
+	}
+
+	if countryCode := phoneNumberStorefrontCountryCode(input.Email); countryCode != "" {
+		if _, err = t.discoverStorefrontID(countryCode); err != nil {
+			return LoginOutput{}, fmt.Errorf("failed to discover storefronts: %w", err)
+		}
 	}
 
 	macAddr, err := t.machine.MacAddress()
@@ -135,13 +159,29 @@ type loginAccountResult struct {
 	Address loginAddressResult `plist:"address,omitempty"`
 }
 
+type loginDialogActionResult struct {
+	Kind string `plist:"kind,omitempty"`
+	URL  string `plist:"url,omitempty"`
+}
+
+type loginDialogResult struct {
+	Message            string                  `plist:"message,omitempty"`
+	Explanation        string                  `plist:"explanation,omitempty"`
+	OKButtonString     string                  `plist:"okButtonString,omitempty"`
+	OKButtonAction     loginDialogActionResult `plist:"okButtonAction,omitempty"`
+	CancelButtonString string                  `plist:"cancelButtonString,omitempty"`
+}
+
 type loginResult struct {
 	FailureType         string             `plist:"failureType,omitempty"`
 	CustomerMessage     string             `plist:"customerMessage,omitempty"`
 	Account             loginAccountResult `plist:"accountInfo,omitempty"`
+	Dialog              loginDialogResult  `plist:"dialog,omitempty"`
 	DirectoryServicesID string             `plist:"dsPersonId,omitempty"`
 	PasswordToken       string             `plist:"passwordToken,omitempty"`
 }
+
+var storeCookieDSIDPattern = regexp.MustCompile(`(?:^|[ ,])mz_at(?:0|_ssl)-([0-9]+)=`)
 
 func (t *appstore) login(email, password, authCode, guid, endpoint string, signer ActionSigner) (Account, error) {
 	request := t.loginRequest(email, password, authCode, guid, endpoint, 1, signer)
@@ -195,6 +235,10 @@ func (t *appstore) login(email, password, authCode, guid, endpoint string, signe
 	}
 
 	sf, err := res.GetHeader(HTTPHeaderStoreFront)
+	if errors.Is(err, http.ErrHeaderNotFound) {
+		sf, err = res.GetHeader(HTTPHeaderRequestStoreFront)
+	}
+
 	if err != nil {
 		return Account{}, NewErrorWithMetadata(fmt.Errorf("failed to get storefront header: %w", err), res)
 	}
@@ -205,11 +249,26 @@ func (t *appstore) login(email, password, authCode, guid, endpoint string, signe
 	}
 
 	addr := res.Data.Account.Address
+
+	directoryServicesID := res.Data.DirectoryServicesID
+	if directoryServicesID == "" {
+		directoryServicesID = authenticationResponseDSID(res.Headers)
+	}
+
+	if directoryServicesID == "" {
+		return Account{}, NewErrorWithMetadata(errors.New("apple returned no directory services identifier"), res)
+	}
+
+	accountEmail := res.Data.Account.Email
+	if accountEmail == "" {
+		accountEmail = email
+	}
+
 	acc := Account{
 		Name:                strings.Join([]string{addr.FirstName, addr.LastName}, " "),
-		Email:               res.Data.Account.Email,
+		Email:               accountEmail,
 		PasswordToken:       res.Data.PasswordToken,
-		DirectoryServicesID: res.Data.DirectoryServicesID,
+		DirectoryServicesID: directoryServicesID,
 		StoreFront:          sf,
 		Password:            password,
 		Pod:                 pod,
@@ -336,7 +395,11 @@ func (t *appstore) parseLoginResponse(res *http.Result[loginResult], attempt int
 		err      error
 	)
 
-	if res.StatusCode >= gohttp.StatusMultipleChoices && res.StatusCode < gohttp.StatusBadRequest {
+	if action := authenticationMachineAction(res.Headers); action != nil {
+		err = action
+	} else if dialogErr := authenticationDialogError(res.Data); dialogErr != nil {
+		err = NewErrorWithMetadata(dialogErr, res)
+	} else if res.StatusCode >= gohttp.StatusMultipleChoices && res.StatusCode < gohttp.StatusBadRequest {
 		if redirect, err = res.GetHeader("location"); err != nil {
 			err = fmt.Errorf("failed to retrieve redirect location: %w", err)
 		} else if !http.IsAuthenticationRedirect(res.StatusCode) {
@@ -368,11 +431,115 @@ func (t *appstore) parseLoginResponse(res *http.Result[loginResult], attempt int
 		} else {
 			err = NewErrorWithMetadata(errors.New("something went wrong"), res)
 		}
-	} else if res.StatusCode != gohttp.StatusOK || res.Data.PasswordToken == "" || res.Data.DirectoryServicesID == "" {
+	} else if res.StatusCode != gohttp.StatusOK || res.Data.PasswordToken == "" {
 		err = fmt.Errorf("apple returned no usable authentication response (HTTP %d): missing account credentials or unexpected status; try again later or from another network", res.StatusCode)
 	}
 
 	return retry, redirect, err
+}
+
+func authenticationDialogError(result loginResult) error {
+	dialog := result.Dialog
+	if strings.TrimSpace(dialog.Message) == "" && strings.TrimSpace(dialog.Explanation) == "" &&
+		strings.TrimSpace(dialog.OKButtonString) == "" && strings.TrimSpace(dialog.CancelButtonString) == "" &&
+		strings.TrimSpace(dialog.OKButtonAction.Kind) == "" && strings.TrimSpace(dialog.OKButtonAction.URL) == "" {
+		return nil
+	}
+
+	message := strings.TrimSpace(dialog.Message)
+	explanation := strings.TrimSpace(dialog.Explanation)
+
+	if message == "" {
+		message = strings.TrimSpace(result.CustomerMessage)
+	}
+
+	actionURL := trustedAuthenticationDialogURL(dialog.OKButtonAction)
+	if message == "" && explanation == "" && actionURL == "" {
+		return nil
+	}
+
+	parts := make([]string, 0, 2)
+	if message != "" {
+		parts = append(parts, message)
+	}
+
+	if explanation != "" && explanation != message {
+		parts = append(parts, explanation)
+	}
+
+	detail := strings.Join(parts, ": ")
+	if detail == "" {
+		detail = "Apple requires action before sign-in can continue"
+	}
+
+	if actionURL != "" {
+		label := strings.TrimSpace(dialog.OKButtonString)
+		if label == "" {
+			label = "Continue"
+		}
+
+		detail += fmt.Sprintf(" (%s: %s)", label, actionURL)
+	}
+
+	return errors.New(detail)
+}
+
+func trustedAuthenticationDialogURL(action loginDialogActionResult) string {
+	if !strings.EqualFold(strings.TrimSpace(action.Kind), "OpenURL") {
+		return ""
+	}
+
+	value, err := url.Parse(strings.TrimSpace(action.URL))
+	if err != nil || value.Scheme != "https" || value.User != nil || value.Fragment != "" || value.Port() != "" && value.Port() != "443" {
+		return ""
+	}
+
+	host := strings.ToLower(value.Hostname())
+	if host != "apple.com" && !strings.HasSuffix(host, ".apple.com") {
+		return ""
+	}
+
+	return value.String()
+}
+
+func authenticationMachineAction(headers map[string]string) *authenticationMachineActionError {
+	var action, data string
+
+	for key, value := range headers {
+		switch {
+		case strings.EqualFold(key, "X-Apple-AMD-Action"):
+			action = strings.TrimSpace(value)
+		case strings.EqualFold(key, "X-Apple-AMD-Data"):
+			data = strings.TrimSpace(value)
+		}
+	}
+
+	if action == "" {
+		return nil
+	}
+
+	return &authenticationMachineActionError{action: action, data: data}
+}
+
+func authenticationResponseDSID(headers map[string]string) string {
+	for key, value := range headers {
+		if strings.EqualFold(key, "X-Dsid") {
+			return strings.TrimSpace(value)
+		}
+	}
+
+	for key, value := range headers {
+		if !strings.EqualFold(key, "Set-Cookie") {
+			continue
+		}
+
+		match := storeCookieDSIDPattern.FindStringSubmatch(value)
+		if len(match) == 2 {
+			return match[1]
+		}
+	}
+
+	return ""
 }
 
 func resolveAuthenticationRedirect(endpoint, location string) (string, error) {
@@ -409,14 +576,34 @@ func authenticationRedirectError(err error, status int, location string) error {
 }
 
 func (t *appstore) loginRequest(email, password, authCode, guid, endpoint string, attempt int, signer ActionSigner) http.Request {
+	headers := map[string]string{
+		"Content-Type": "application/x-apple-plist",
+		"User-Agent":   storeAuthenticationUserAgent,
+	}
+
+	for key, values := range t.authenticationHeaders {
+		if strings.EqualFold(key, "X-Apple-I-MD") || strings.EqualFold(key, "X-Apple-I-MD-M") {
+			continue
+		}
+
+		headers[key] = strings.Join(values, ", ")
+	}
+
+	if value := t.authenticationHeaders.Get("X-Apple-I-MD"); value != "" {
+		headers["X-Apple-AMD"] = value
+	}
+
+	if value := t.authenticationHeaders.Get("X-Apple-I-MD-M"); value != "" {
+		headers["X-Apple-AMD-M"] = value
+	}
+
 	request := http.Request{
 		Method:         http.MethodPOST,
 		URL:            endpoint,
 		ResponseFormat: http.ResponseFormatXML,
 		ActionSigner:   signer,
-		Headers: map[string]string{
-			"Content-Type": "application/x-www-form-urlencoded",
-		},
+		NoRedirects:    true,
+		Headers:        headers,
 		Payload: &http.XMLPayload{
 			Content: map[string]interface{}{
 				"appleId":  email,
@@ -428,7 +615,7 @@ func (t *appstore) loginRequest(email, password, authCode, guid, endpoint string
 			},
 		},
 	}
-	if storefront := phoneNumberStorefront(email); storefront != "" {
+	if storefront := t.storefrontID(phoneNumberStorefrontCountryCode(email)); storefront != "" {
 		request.Headers["X-Apple-Store-Front"] = storefront
 	}
 

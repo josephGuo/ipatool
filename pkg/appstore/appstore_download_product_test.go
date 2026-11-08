@@ -42,9 +42,10 @@ var _ = Describe("AppStore (Download Product)", func() {
 		mockDownloadClient = http.NewMockClient[downloadResult](ctrl)
 		mockPlatformClient = http.NewMockClient[platformVersionLookupResult](ctrl)
 		store = &appstore{
-			bagClient:      mockBagClient,
-			downloadClient: mockDownloadClient,
-			platformClient: mockPlatformClient,
+			bagClient:              mockBagClient,
+			downloadClient:         mockDownloadClient,
+			platformClient:         mockPlatformClient,
+			storefrontCountryCodes: testStorefrontCountryCodes(),
 		}
 		account = Account{
 			DirectoryServicesID: "test-dsid",
@@ -121,7 +122,7 @@ var _ = Describe("AppStore (Download Product)", func() {
 			mockBagClient.EXPECT().
 				Send(gomock.Any()).
 				Do(func(req http.Request) {
-					Expect(req.URL).To(Equal("https://init.itunes.apple.com/bag.xml?guid=" + testGUID))
+					Expect(req.URL).To(Equal("https://init.itunes.apple.com/bag.xml?ix=6&guid=" + testGUID))
 				}).
 				Return(http.Result[bagResult]{StatusCode: gohttp.StatusOK, Data: bag}, nil),
 			mockDownloadClient.EXPECT().
